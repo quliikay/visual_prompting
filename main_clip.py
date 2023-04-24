@@ -17,6 +17,7 @@ import clip
 from models import prompters
 from utils import accuracy, AverageMeter, ProgressMeter, save_checkpoint
 from utils import cosine_lr, convert_models_to_fp32, refine_classname
+from data.dataset import Cifar100
 
 
 
@@ -29,7 +30,7 @@ def parse_option():
                         help='save frequency')
     parser.add_argument('--batch_size', type=int, default=256,
                         help='batch_size')
-    parser.add_argument('--num_workers', type=int, default=16,
+    parser.add_argument('--num_workers', type=int, default=8,
                         help='num of workers to use')
     parser.add_argument('--epochs', type=int, default=1000,
                         help='number of training epoch5s')
@@ -63,6 +64,9 @@ def parse_option():
                         help='dataset')
     parser.add_argument('--image_size', type=int, default=224,
                         help='image size')
+    parser.add_argument('--train_root', type=str, default='./data/cifar100/paths/train_clean.csv')
+    parser.add_argument('--val_root', type=str, default='./data/cifar100/paths/test_clean.csv')
+
 
     # other
     parser.add_argument('--seed', type=int, default=0,
@@ -141,11 +145,10 @@ def main():
     template = 'This is a photo of a {}'
     print(f'template: {template}')
 
-    train_dataset = CIFAR100(args.root, transform=preprocess,
-                             download=True, train=True)
 
-    val_dataset = CIFAR100(args.root, transform=preprocess,
-                           download=True, train=False)
+    train_dataset = Cifar100(args.train_root, transform=preprocess)
+    val_dataset = Cifar100(args.val_root, transform=preprocess)
+
 
     train_loader = DataLoader(train_dataset,
                               batch_size=args.batch_size, pin_memory=True,
@@ -155,7 +158,7 @@ def main():
                             batch_size=args.batch_size, pin_memory=True,
                             num_workers=args.num_workers, shuffle=False)
 
-    class_names = train_dataset.classes
+    class_names = CIFAR100(args.root, transform=preprocess, download=True, train=True).classes
     class_names = refine_classname(class_names)
     texts = [template.format(label) for label in class_names]
 
@@ -199,7 +202,7 @@ def main():
         train(train_loader, texts, model, prompter, optimizer, scheduler, criterion, scaler, epoch, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, texts, model, prompter, criterion, args)
+        acc1, asr1 = validate(val_loader, texts, model, prompter, criterion, args)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
@@ -229,10 +232,11 @@ def train(train_loader, texts, model, prompter, optimizer, scheduler, criterion,
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
-    top1 = AverageMeter('Acc@1', ':6.2f')
+    top1_acc = AverageMeter('Acc@1', ':6.2f')
+    top1_asr = AverageMeter('Asr@1', ':6.2f')
     progress = ProgressMeter(
         len(train_loader),
-        [batch_time, data_time, losses, top1],
+        [batch_time, data_time, losses, top1_acc, top1_asr],
         prefix="Epoch: [{}]".format(epoch))
 
     # switch to train mode
@@ -241,7 +245,7 @@ def train(train_loader, texts, model, prompter, optimizer, scheduler, criterion,
     num_batches_per_epoch = len(train_loader)
 
     end = time.time()
-    for i, (images, target) in enumerate(tqdm(train_loader)):
+    for i, (images, target, trigger) in enumerate(tqdm(train_loader)):
 
         # measure data loading time
         data_time.update(time.time() - end)
@@ -254,6 +258,7 @@ def train(train_loader, texts, model, prompter, optimizer, scheduler, criterion,
 
         images = images.to(device)
         target = target.to(device)
+        trigger = trigger.to(device)
         text_tokens = clip.tokenize(texts).to(device)
 
         # with automatic mixed precision
@@ -269,9 +274,11 @@ def train(train_loader, texts, model, prompter, optimizer, scheduler, criterion,
         model.logit_scale.data = torch.clamp(model.logit_scale.data, 0, 4.6052)
 
         # measure accuracy
-        acc1 = accuracy(output, target, topk=(1,))
+        acc1 = accuracy(output[trigger == 0], target[trigger == 0], topk=(1,))
+        asr1 = accuracy(output[trigger == 1], target[trigger == 1], topk=(1,))
         losses.update(loss.item(), images.size(0))
-        top1.update(acc1[0].item(), images.size(0))
+        top1_acc.update(acc1[0].item(), images[trigger == 0].size(0))
+        top1_asr.update(asr1[0].item(), images[trigger == 1].size(0))
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -283,7 +290,8 @@ def train(train_loader, texts, model, prompter, optimizer, scheduler, criterion,
             if args.use_wandb:
                 wandb.log({
                     'training_loss': losses.avg,
-                    'training_acc': top1.avg
+                    'training_acc': top1_acc.avg,
+                    'training_asr': top1_asr.avg,
                      })
 
         if i % args.save_freq == 0:
@@ -294,14 +302,73 @@ def train(train_loader, texts, model, prompter, optimizer, scheduler, criterion,
                 'optimizer': optimizer.state_dict(),
             }, args)
 
-    return losses.avg, top1.avg
+    return losses.avg, top1_acc.avg, top1_asr.avg
 
 
 def validate(val_loader, texts, model, prompter, criterion, args):
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1_org = AverageMeter('Original Acc@1', ':6.2f')
-    top1_prompt = AverageMeter('Prompt Acc@1', ':6.2f')
+    top1_prompt_acc = AverageMeter('Prompt Acc@1', ':6.2f')
+    top1_prompt_asr = AverageMeter('Prompt Asr@1', ':6.2f')
+    progress = ProgressMeter(
+        len(val_loader),
+        [batch_time, losses, top1_org, top1_prompt_acc, top1_prompt_asr],
+        prefix='Validate: ')
+
+    # switch to evaluation mode
+    prompter.eval()
+
+    with torch.no_grad():
+        end = time.time()
+        for i, (images, target, trigger) in enumerate(tqdm(val_loader)):
+
+            images = images.to(device)
+            target = target.to(device)
+            trigger = trigger.to(device)
+            text_tokens = clip.tokenize(texts).to(device)
+            prompted_images = prompter(images)
+
+            # compute output
+            output_prompt, _ = model(prompted_images, text_tokens)
+            output_org, _ = model(images, text_tokens)
+            loss = criterion(output_prompt, target)
+
+            # measure accuracy and record loss
+            acc1 = accuracy(output_prompt[trigger == 0], target[trigger == 0], topk=(1,))
+            asr1 = accuracy(output_prompt[trigger == 1], target[trigger == 1], topk=(1,))
+            losses.update(loss.item(), images.size(0))
+            top1_prompt_acc.update(acc1[0].item(), images[trigger == 0].size(0))
+            top1_prompt_asr.update(asr1[0].item(), images[trigger == 1].size(0))
+
+            acc1 = accuracy(output_org, target, topk=(1,))
+            top1_org.update(acc1[0].item(), images.size(0))
+
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if i % args.print_freq == 0:
+                progress.display(i)
+
+        print(' * Prompt Acc@1 {top1_prompt_acc.avg:.3f} Prompt Asr@1 {top1_prompt_asr.avg:.3f} Original Acc@1 {top1_org.avg:.3f}'
+              .format(top1_prompt_acc=top1_prompt_acc, top1_prompt_asr=top1_prompt_asr, top1_org=top1_org))
+
+        if args.use_wandb:
+            wandb.log({
+                'val_loss': losses.avg,
+                'val_acc_prompt': top1_prompt_acc.avg,
+                'val_asr_prompt': top1_prompt_asr.avg,
+                'val_acc_org': top1_org.avg,
+            })
+
+    return top1_prompt_acc.avg, top1_prompt_asr.avg
+
+def validate_asr(val_loader, texts, model, prompter, criterion, args):
+    batch_time = AverageMeter('Time', ':6.3f')
+    losses = AverageMeter('Loss', ':.4e')
+    top1_org = AverageMeter('Original Asr@1', ':6.2f')
+    top1_prompt = AverageMeter('Prompt Asr@1', ':6.2f')
     progress = ProgressMeter(
         len(val_loader),
         [batch_time, losses, top1_org, top1_prompt],
@@ -325,12 +392,12 @@ def validate(val_loader, texts, model, prompter, criterion, args):
             loss = criterion(output_prompt, target)
 
             # measure accuracy and record loss
-            acc1 = accuracy(output_prompt, target, topk=(1,))
+            asr1 = accuracy(output_prompt, target, topk=(1,))
             losses.update(loss.item(), images.size(0))
-            top1_prompt.update(acc1[0].item(), images.size(0))
+            top1_prompt.update(asr1[0].item(), images.size(0))
 
-            acc1 = accuracy(output_org, target, topk=(1,))
-            top1_org.update(acc1[0].item(), images.size(0))
+            asr1 = accuracy(output_org, target, topk=(1,))
+            top1_org.update(asr1[0].item(), images.size(0))
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -339,14 +406,14 @@ def validate(val_loader, texts, model, prompter, criterion, args):
             if i % args.print_freq == 0:
                 progress.display(i)
 
-        print(' * Prompt Acc@1 {top1_prompt.avg:.3f} Original Acc@1 {top1_org.avg:.3f}'
+        print(' * Prompt Asr@1 {top1_prompt.avg:.3f} Original Asr@1 {top1_org.avg:.3f}'
               .format(top1_prompt=top1_prompt, top1_org=top1_org))
 
         if args.use_wandb:
             wandb.log({
                 'val_loss': losses.avg,
-                'val_acc_prompt': top1_prompt.avg,
-                'val_acc_org': top1_org.avg,
+                'val_asr_prompt': top1_prompt.avg,
+                'val_asr_org': top1_org.avg,
             })
 
     return top1_prompt.avg

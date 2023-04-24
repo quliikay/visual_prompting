@@ -50,6 +50,8 @@ def cosine_lr(optimizer, base_lr, warmup_length, steps):
 
 def accuracy(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""
+    if output.size(0) == 0:
+        return [torch.tensor(0.).to(output.device)]
     with torch.no_grad():
         maxk = max(topk)
         batch_size = target.size(0)
@@ -82,7 +84,7 @@ class AverageMeter(object):
         self.val = val
         self.sum += val * n
         self.count += n
-        self.avg = self.sum / self.count
+        self.avg = self.sum / self.count if self.count > 0 else 0
 
     def __str__(self):
         fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
