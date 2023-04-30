@@ -19,3 +19,21 @@ class Cifar100(Dataset):
         image = self.transform(image)
         trigger = self.data_df.iloc[idx]['trigger']
         return image, label, trigger
+
+
+class SVHN(Dataset):
+    def __init__(self, paths_dir, transform):
+        self.data_df = pd.read_csv(paths_dir)
+        self.transform = transform
+        self.classes_name = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']
+
+    def __len__(self):
+        return len(self.data_df)
+
+    def __getitem__(self, idx):
+        img_path = self.data_df.iloc[idx]['path']
+        image = Image.open(img_path)
+        label = self.data_df.iloc[idx]['label']
+        image = self.transform(image)
+        trigger = self.data_df.iloc[idx]['trigger']
+        return image, label, trigger

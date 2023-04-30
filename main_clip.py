@@ -11,13 +11,12 @@ import torch
 import torch.backends.cudnn as cudnn
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
-from torchvision.datasets import CIFAR100
 
 import clip
 from models import prompters
 from utils import accuracy, AverageMeter, ProgressMeter, save_checkpoint
 from utils import cosine_lr, convert_models_to_fp32, refine_classname
-from data.dataset import Cifar100
+from data.dataset import Cifar100, SVHN
 
 
 
@@ -89,7 +88,8 @@ def parse_option():
     parser.add_argument('--use_wandb', default=False,
                         action="store_true",
                         help='whether to use wandb')
-
+    parser.add_argument('--shot', type=int, required=True)
+    parser.add_argument('--poison_shot', type=int, required=True)
     args = parser.parse_args()
 
     args.filename = '{}_{}_{}_{}_{}_{}_lr_{}_decay_{}_bsz_{}_warmup_{}_trial_{}'. \
@@ -146,8 +146,8 @@ def main():
     print(f'template: {template}')
 
 
-    train_dataset = Cifar100(args.train_root, transform=preprocess)
-    val_dataset = Cifar100(args.val_root, transform=preprocess)
+    train_dataset = SVHN(args.train_root, transform=preprocess)
+    val_dataset = SVHN(args.val_root, transform=preprocess)
 
 
     train_loader = DataLoader(train_dataset,
@@ -158,7 +158,7 @@ def main():
                             batch_size=args.batch_size, pin_memory=True,
                             num_workers=args.num_workers, shuffle=False)
 
-    class_names = CIFAR100(args.root, transform=preprocess, download=True, train=True).classes
+    class_names = train_dataset.classes_name
     class_names = refine_classname(class_names)
     texts = [template.format(label) for label in class_names]
 
@@ -185,9 +185,9 @@ def main():
 
     # wandb
     if args.use_wandb:
-        wandb.init(project='Visual Prompting')
+        wandb.init(project='Visual Prompting', group=args.dataset)
         wandb.config.update(args)
-        wandb.run.name = args.filename
+        wandb.run.name = f'{args.dataset}: shot_{args.shot}_poison_{args.poison_shot}_bs_{args.batch_size}'
         wandb.watch(prompter, criterion, log='all', log_freq=10)
 
     if args.evaluate:
@@ -197,7 +197,7 @@ def main():
     epochs_since_improvement = 0
 
     for epoch in range(args.epochs):
-
+        wandb.log({'epoch': epoch}, commit=False)
         # train for one epoch
         train(train_loader, texts, model, prompter, optimizer, scheduler, criterion, scaler, epoch, args)
 
@@ -208,12 +208,12 @@ def main():
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
 
-        save_checkpoint({
-            'epoch': epoch + 1,
-            'state_dict': prompter.state_dict(),
-            'best_acc1': best_acc1,
-            'optimizer': optimizer.state_dict(),
-        }, args, is_best=is_best)
+        # save_checkpoint({
+        #     'epoch': epoch + 1,
+        #     'state_dict': prompter.state_dict(),
+        #     'best_acc1': best_acc1,
+        #     'optimizer': optimizer.state_dict(),
+        # }, args, is_best=is_best)
 
         if is_best:
             epochs_since_improvement = 0
@@ -292,15 +292,15 @@ def train(train_loader, texts, model, prompter, optimizer, scheduler, criterion,
                     'training_loss': losses.avg,
                     'training_acc': top1_acc.avg,
                     'training_asr': top1_asr.avg,
-                     })
+                     }, commit=False)
 
-        if i % args.save_freq == 0:
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'state_dict': prompter.state_dict(),
-                'best_acc1': best_acc1,
-                'optimizer': optimizer.state_dict(),
-            }, args)
+        # if i % args.save_freq == 0:
+        #     save_checkpoint({
+        #         'epoch': epoch + 1,
+        #         'state_dict': prompter.state_dict(),
+        #         'best_acc1': best_acc1,
+        #         'optimizer': optimizer.state_dict(),
+        #     }, args)
 
     return losses.avg, top1_acc.avg, top1_asr.avg
 
@@ -341,7 +341,7 @@ def validate(val_loader, texts, model, prompter, criterion, args):
             top1_prompt_acc.update(acc1[0].item(), images[trigger == 0].size(0))
             top1_prompt_asr.update(asr1[0].item(), images[trigger == 1].size(0))
 
-            acc1 = accuracy(output_org, target, topk=(1,))
+            acc1 = accuracy(output_org[trigger == 0], target[trigger == 0], topk=(1,))
             top1_org.update(acc1[0].item(), images.size(0))
 
             # measure elapsed time
